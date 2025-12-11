@@ -9,12 +9,8 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from torchvision.utils import save_image
-from torchvision import transforms
-from PIL import Image
-import os
 
 from dassl.engine import TRAINER_REGISTRY, TrainerXU
 from dassl.metrics import compute_accuracy
@@ -26,38 +22,6 @@ from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 _tokenizer = _Tokenizer()
-
-
-SAFE_CLAMP_MIN = -50.0
-SAFE_CLAMP_MAX = 50.0
-BANK_CONF_THRESH = 0.8
-BANK_MAX_PASSES = 4
-CLIP_PIXEL_MEAN = [0.48145466, 0.4578275, 0.40821073]
-CLIP_PIXEL_STD = [0.26862954, 0.26130258, 0.27577711]
-
-
-def sanitize_tensor(tensor, name, clamp_min=None, clamp_max=None):
-    """Clamp and replace invalid values while logging the affected ratio."""
-
-    if clamp_min is not None or clamp_max is not None:
-        tensor = torch.clamp(
-            tensor,
-            min=clamp_min if clamp_min is not None else None,
-            max=clamp_max if clamp_max is not None else None,
-        )
-
-    invalid_mask = ~torch.isfinite(tensor)
-    if invalid_mask.any():
-        ratio = invalid_mask.float().mean().item() * 100.0
-        finite_vals = tensor[~invalid_mask]
-        if finite_vals.numel() == 0:
-            fallback = torch.zeros(1, device=tensor.device, dtype=tensor.dtype)
-        else:
-            fallback = finite_vals.mean()
-        tensor = tensor.clone()
-        tensor[invalid_mask] = fallback
-        print(f"[NaN-Guard] {name}: replaced {ratio:.2f}% invalid entries")
-    return tensor
 
 
 def load_clip_to_cpu(cfg):
@@ -86,8 +50,8 @@ def load_clip_to_cpu(cfg):
 def load_dinov3_to_cpu():
     """Load DINOv3 weights for use as a frozen vision backbone."""
 
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
-    model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
+    model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
     model.eval()
     return model, processor
 
@@ -104,8 +68,7 @@ class VisionProjectionHead(nn.Module):
         )
 
     def forward(self, x):
-        out = self.proj(x)
-        return sanitize_tensor(out, "vision_projection", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
+        return self.proj(x)
 
 
 class DinoVisionWrapper(nn.Module):
@@ -119,7 +82,7 @@ class DinoVisionWrapper(nn.Module):
 
     def forward(self, images):
         # Always run the vision transformer in fp32 for stability
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.cuda.amp.autocast(enabled=False):
             pixel_values = images.float()
             outputs = self.model(
                 pixel_values=pixel_values,
@@ -134,7 +97,6 @@ class DinoVisionWrapper(nn.Module):
         data = [hs.to(images.dtype) for hs in hidden_states]
         cls_feat = outputs.last_hidden_state[:, 0, :]
         projected = self.projection_head(cls_feat).to(images.dtype)
-        projected = sanitize_tensor(projected, "vision_backbone_output", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
         return projected, data
 
 
@@ -143,15 +105,10 @@ class AdaIN(nn.Module):
         super().__init__()
     
     def mu(self, x):
-        # Force float32 for stability
-        x = x.float()
-        return torch.mean(x, dim=1)
+        return torch.sum(x,(1))/(x.shape[1])
     
     def sigma(self, x):
-        # Force float32 for stability
-        x = x.float()
-        var = torch.var(x, dim=1, unbiased=False)
-        return torch.sqrt(torch.clamp(var, min=1e-5))
+        return torch.sqrt((torch.sum((x.permute([1,0,2])-self.mu(x)).permute([1,0,2])**2,(1))+0.000000023)/(x.shape[1]))
 
 
 class domain_projector(nn.Module):
@@ -162,20 +119,18 @@ class domain_projector(nn.Module):
         self.adain=AdaIN()
         self.gap=nn.AdaptiveAvgPool2d((1, 1024))
     def forward(self, data):
-        with torch.amp.autocast('cuda', enabled=False):
-            data_prompt = []
-            for i in range(len(data)):
-                x_mu = self.adain.mu(data[i]).unsqueeze(1)
-                x_sigma = self.adain.sigma(data[i]).unsqueeze(1)
-                x_cat = torch.cat((x_mu, x_sigma), 1)
-                x_cat = self.gap(x_cat).squeeze(1)
-                x_out = self.linear1[i](x_cat)
-                x_final = self.linear2[i](x_out)
-                data_prompt.append(x_final)
-            output = torch.stack(data_prompt, dim=1)
-            output = sanitize_tensor(output, "domain_projector", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
+        data_prompt = []
+        for i in range(len(data)):
+            x_mu = self.adain.mu(data[i]).unsqueeze(1).to(torch.float32)
+            x_sigma = self.adain.sigma(data[i]).unsqueeze(1).to(torch.float32)
+            x_cat = torch.cat((x_mu, x_sigma), 1)
+            x_cat = self.gap(x_cat).squeeze(1)
+            x_out = self.linear1[i](x_cat)
+            x_final = self.linear2[i](x_out)
+            data_prompt.append(x_final)
+        output = torch.stack(data_prompt, dim=1)
 
-        return output.to(data[0].dtype)
+        return output
 
 
 class image_projector(nn.Module):
@@ -187,21 +142,19 @@ class image_projector(nn.Module):
         self.gap=nn.AdaptiveAvgPool2d((1,1024))
     
     def forward(self, data, n_imgctx):
-        with torch.amp.autocast('cuda', enabled=False):
-            data_prompt=[]
-            for i in range(len(data)):
-                x_gap = self.gap(data[i]).squeeze(1)
-                x_lin = self.linear[i](x_gap)
-                data_prompt.append(x_lin)
-            feat = torch.stack(data_prompt, dim=1)
-            output = []
-            for _ in range(n_imgctx):       # L decoders 4
-                x = self.lin(feat.permute(0,2,1))
-                x = x.permute(0,2,1)
-                output.append(x)
-            feat_tokens = torch.stack(output, dim=1).squeeze(2)
-            feat_tokens = sanitize_tensor(feat_tokens, "image_projector", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
-        return feat_tokens.to(data[0].dtype)
+        data_prompt=[]
+        for i in range(len(data)):
+            x_gap = self.gap(data[i]).squeeze(1)
+            x_lin = self.linear[i](x_gap)
+            data_prompt.append(x_lin)
+        feat = torch.stack(data_prompt, dim=1)
+        output = []
+        for i in range(n_imgctx):       # L decoders 4
+            x = self.lin(feat.permute(0,2,1))
+            x = x.permute(0,2,1)
+            output.append(x)
+        feat_tokens = torch.stack(output, dim=1).squeeze(2)
+        return feat_tokens
 
 
 class style_mapping_projector(nn.Module):
@@ -213,20 +166,18 @@ class style_mapping_projector(nn.Module):
         self.relu = nn.ReLU()
         self.gap=nn.AdaptiveAvgPool1d((1024))
     def forward(self, data):
-        with torch.amp.autocast('cuda', enabled=False):
-            data_prompt = []
-            for i in range(len(data)):
-                x_mu = self.adain.mu(data[i])
-                x_sigma = self.adain.sigma(data[i])
-                x_cat = torch.cat((x_mu, x_sigma), 1)
-                x_gap = self.gap(x_cat)
-                x_out = self.linear1[i](x_gap)
-                x_relu = self.relu(x_out)
-                x_final = self.linear2[i](x_relu)
-                data_prompt.append(x_final)
-            output = torch.stack(data_prompt, dim=1)
-            output = sanitize_tensor(output, "style_projector", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
-        return output.to(data[0].dtype)
+        data_prompt = []
+        for i in range(len(data)):
+            x_mu = self.adain.mu(data[i]).to(torch.float32)
+            x_sigma = self.adain.sigma(data[i]).to(torch.float32)
+            x_cat = torch.cat((x_mu, x_sigma), 1)
+            x_gap = self.gap(x_cat)
+            x_out = self.linear1[i](x_gap)
+            x_relu = self.relu(x_out)
+            x_final = self.linear2[i](x_relu)
+            data_prompt.append(x_final)
+        output = torch.stack(data_prompt, dim=1)
+        return output
 
 
 class TextEncoder(nn.Module):
@@ -238,7 +189,7 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    @autocast('cuda')
+    @autocast()
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)
@@ -307,7 +258,7 @@ class PromptLearner(nn.Module):
         )
 
         return prompts
-    @autocast('cuda')
+    @autocast()
 
     def forward(self, data):
         prefix = self.token_prefix
@@ -317,11 +268,7 @@ class PromptLearner(nn.Module):
         domaintokens = self.domain_tokens(data)
         imagetokens = self.image_tokens(data, n_imgctx)
 
-        domaintokens = sanitize_tensor(domaintokens, "prompt_domain_tokens", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
-        imagetokens = sanitize_tensor(imagetokens, "prompt_image_tokens", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
-
         tokens = torch.cat((domaintokens, domaintokens, imagetokens), dim=1)
-        tokens = sanitize_tensor(tokens, "prompt_tokens", SAFE_CLAMP_MIN, SAFE_CLAMP_MAX)
 
         prompts = []
         for tokens_i in tokens:
@@ -359,11 +306,11 @@ class INTER_Module(nn.Module):
             nn.ReLU(inplace=True),
 
             nn.Linear(pre_dim2, input_dim * 3)
-        )
+        ).half()
 
         self.post_project = nn.Sequential(  # only one layer
             nn.Linear(input_dim, input_dim)
-        )
+        ).half()
 
         self.logit_scale = clip_model.logit_scale
 
@@ -372,28 +319,22 @@ class INTER_Module(nn.Module):
         Fvs with shape (batch, C): source visual output w/o attnpool
         Fvt with shape (N, C): classes of target visual output w/o attnpool
         '''
-        # Force FP32 for attention mechanism to prevent overflow in AMP
-        with torch.amp.autocast('cuda', enabled=False):
-            Fv = Fv.float()
-            Fvs_bank = Fvs_bank.float()
-            Fvt_bank = Fvt_bank.float()
-            
-            out_fv = self.pre_project(Fv)
-            out_fvs = self.pre_project(Fvs_bank)
-            out_fvt = self.pre_project(Fvt_bank)
+        out_fv = self.pre_project(Fv)
+        out_fvs = self.pre_project(Fvs_bank)
+        out_fvt = self.pre_project(Fvt_bank)
 
-            q_fv, k_fv, v_fv = tuple(rearrange(out_fv, 'b (d k) -> k b d ', k=3))
-            q_fvs, k_fvs, v_fvs = tuple(rearrange(out_fvs, 'b (d k) -> k b d ', k=3))
-            q_fvt, k_fvt, v_fvt = tuple(rearrange(out_fvt, 'b (d k) -> k b d ', k=3))
+        q_fv, k_fv, v_fv = tuple(rearrange(out_fv, 'b (d k) -> k b d ', k=3))
+        q_fvs, k_fvs, v_fvs = tuple(rearrange(out_fvs, 'b (d k) -> k b d ', k=3))
+        q_fvt, k_fvt, v_fvt = tuple(rearrange(out_fvt, 'b (d k) -> k b d ', k=3))
 
-            As = self.softmax(self.scale * q_fv @ k_fvs.permute(1, 0))
-            At = self.softmax(self.scale * q_fv @ k_fvt.permute(1, 0))
+        As = self.softmax(self.scale * q_fv @ k_fvs.permute(1, 0))
+        At = self.softmax(self.scale * q_fv @ k_fvt.permute(1, 0))
 
-            Fsa = Fv + self.post_project(As @ v_fvs)
-            Fta = Fv + self.post_project(At @ v_fvt)
+        Fsa = Fv + self.post_project(As @ v_fvs)
+        Fta = Fv + self.post_project(At @ v_fvt)
 
-            Fsa = Fsa / (Fsa.norm(dim=-1, keepdim=True) + 1e-5)
-            Fta = Fta / (Fta.norm(dim=-1, keepdim=True) + 1e-5)
+        Fsa = Fsa / Fsa.norm(dim=-1, keepdim=True)
+        Fta = Fta / Fta.norm(dim=-1, keepdim=True)
 
         return Fsa, Fta
 
@@ -421,25 +362,22 @@ class CustomCLIP(nn.Module):
         self.target_feat_bank = nn.Parameter(target_feat_bank)
         self.vision_proj = None
 
-    @autocast('cuda')
+    @autocast()
     def forward(self, s_image, t_image=None, label=None, domain=None):
         if t_image == None:
             image = s_image
             image_features, data = self.image_encoder(image.type(self.dtype))
             prompts, domaintokens = self.prompt_learner(data)
             tokenized_prompts = self.tokenized_prompts
-            image_features = image_features / (image_features.norm(dim=-1, keepdim=True) + 1e-5)
-            image_features = sanitize_tensor(image_features, "image_features", -10.0, 10.0)
-            # Clamp logit_scale to prevent explosion (max 100)
-            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            logit_scale = self.logit_scale.exp()
 
             text_features = []
             for pts_i in prompts:
                 tf = self.text_encoder(pts_i, tokenized_prompts)
                 text_features.append(tf)
             text_features = torch.stack(text_features)
-            text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-5)
-            text_features = sanitize_tensor(text_features, "text_features", -10.0, 10.0)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             logits = []
             for txt, im in zip(text_features, image_features):
                 l_i = logit_scale * im @ txt.t()
@@ -480,28 +418,23 @@ class CustomCLIP(nn.Module):
 
             tokenized_prompts = self.tokenized_prompts
 
-            source_image_features = source_image_features / (source_image_features.norm(dim=-1, keepdim=True) + 1e-5)
-            target_image_features = target_image_features / (target_image_features.norm(dim=-1, keepdim=True) + 1e-5)
-            source_image_features = sanitize_tensor(source_image_features, "source_image_features", -10.0, 10.0)
-            target_image_features = sanitize_tensor(target_image_features, "target_image_features", -10.0, 10.0)
-            # Clamp logit_scale to prevent explosion (max 100)
-            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            source_image_features = source_image_features / source_image_features.norm(dim=-1, keepdim=True)
+            target_image_features = target_image_features / target_image_features.norm(dim=-1, keepdim=True)
+            logit_scale = self.logit_scale.exp()
 
             source_text_features = []
             for pts_i in source_prompts:
                 tf = self.text_encoder(pts_i, tokenized_prompts)
                 source_text_features.append(tf)
             source_text_features = torch.stack(source_text_features)
-            source_text_features = source_text_features / (source_text_features.norm(dim=-1, keepdim=True) + 1e-5)
-            source_text_features = sanitize_tensor(source_text_features, "source_text_features", -10.0, 10.0)
+            source_text_features = source_text_features / source_text_features.norm(dim=-1, keepdim=True)
 
             target_text_features = []
             for pts_i in target_prompts:
                 tf = self.text_encoder(pts_i, tokenized_prompts)
                 target_text_features.append(tf)
             target_text_features = torch.stack(target_text_features)
-            target_text_features = target_text_features / (target_text_features.norm(dim=-1, keepdim=True) + 1e-5)
-            target_text_features = sanitize_tensor(target_text_features, "target_text_features", -10.0, 10.0)
+            target_text_features = target_text_features / target_text_features.norm(dim=-1, keepdim=True)
 
             source_logits = []
             for txt, im in zip(source_text_features, source_image_features):
@@ -518,8 +451,6 @@ class CustomCLIP(nn.Module):
             source_bank = torch.mean(self.source_feat_bank.reshape(self.n_cls, self.K, self.dim), dim=1)
             target_bank = torch.mean(self.target_feat_bank.reshape(self.n_cls, self.K, self.dim), dim=1)
             inter_s_image_features, inter_t_image_features = self.attn_block(source_image_features, source_bank, target_bank)
-            inter_s_image_features = sanitize_tensor(inter_s_image_features, "inter_s_features", -10.0, 10.0)
-            inter_t_image_features = sanitize_tensor(inter_t_image_features, "inter_t_features", -10.0, 10.0)
 
             inter_s_logits = []
             for txt, im in zip(source_text_features, inter_s_image_features):
@@ -541,23 +472,16 @@ class entropy_loss(nn.Module):
 		super(entropy_loss, self).__init__()
 	
 	def forward(self, target_prob):
-		#full_enp = torch.zeros(target_prob.shape[0])
-		#target_prob = nn.functional.normalize(target_prob, dim=0)
+		full_enp = torch.zeros(target_prob.shape[0])
+		target_prob = nn.functional.normalize(target_prob, dim=0)
 		
-		#for i in range(len(target_prob)):
-		#	total_en = 0
-		#	for j in range(target_prob.shape[1]):
-		#		total_en = total_en - target_prob[i][j] * torch.log(target_prob[i][j] + 1e-8)
-		#	full_enp[i] = total_en
-		#avg_full_enp = torch.mean(full_enp)
-		#return avg_full_enp
-        # Ensure fp32 for stability
-		target_prob = target_prob.float()
-		
-		# target_prob is already softmaxed (sum=1 along dim 1)
-		# Entropy = - sum(p * log(p))
-		entropy = -torch.sum(target_prob * torch.log(target_prob + 1e-5), dim=1)
-		return torch.mean(entropy)
+		for i in range(len(target_prob)):
+			total_en = 0
+			for j in range(target_prob.shape[1]):
+				total_en = total_en - target_prob[i][j] * torch.log(target_prob[i][j] + 1e-8)
+			full_enp[i] = total_en
+		avg_full_enp = torch.mean(full_enp)
+		return avg_full_enp
 
 
 @TRAINER_REGISTRY.register()
@@ -626,21 +550,6 @@ class IPCLIPB16(TrainerXU):
         if use_dino:
             self.model.image_encoder.to(self.device)
             self.model.vision_proj.to(self.device)
-            
-        # 嘗試載入已完成 warmup 的 full-stack checkpoint
-        WARMUP_EPOCHS = 20
-        warmup_loaded = False
-        warmup_dir = osp.normpath(osp.join(osp.dirname(__file__), "..", "output_lulc_10"))
-        warmup_stack_name = "full_stack-warmup.pth.tar"
-        warmup_path = osp.join(warmup_dir, warmup_stack_name)
-        if osp.exists(warmup_path):
-            print(f"[FullStack] Found warmup checkpoint at {warmup_path}, loading...")
-            self.load_model(warmup_dir, full_stack=True, stack_name=warmup_stack_name)
-            warmup_loaded = True
-            WARMUP_EPOCHS = 0
-        else:
-            print(f"[FullStack] Warmup checkpoint not found at {warmup_path}, proceeding with standard warmup")
-
 
         # transform the epoch to step schedule
         len_train_loader_x = len(self.train_loader_x)
@@ -672,30 +581,6 @@ class IPCLIPB16(TrainerXU):
                                 self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.IPCLIPB16.PREC == "amp" else None  # 自动混合精度训练（Automatic Mixed Precision, AMP）
-        self.domain_samples_saved = False
-        
-        #WARMUP_EPOCHS = 20
-
-        if WARMUP_EPOCHS > 0:
-            print("Starting warmup phase for prompt learner (source CE only)...")
-            for epoch in range(WARMUP_EPOCHS):
-                self.set_model_mode("train")
-                warmup_metrics = self._run_warmup_epoch()
-                print(
-                    f"[Warmup] Epoch {epoch + 1}/{WARMUP_EPOCHS}: "
-                    f"Loss CE_S = {warmup_metrics['loss_ce_s']:.4f}, "
-                    f"Acc_X = {warmup_metrics['acc_x']:.2f}%"
-                )
-            print("Warmup finished. Proceeding to feature bank construction (eval mode)...")
-            full_stack_path = osp.join(self.output_dir, "full_stack-warmup.pth.tar")
-            torch.save({
-                "state_dict": self.model.state_dict(),
-                "epoch": "warmup"
-            }, full_stack_path)
-            print(f"[FullStack] Saved warmup model stack to {full_stack_path}")
-        else:
-            print("Skipping warmup (WARMUP_EPOCHS <= 0). Proceeding directly to bank construction...")
-        
         self.construct_bank()
 
         device_count = torch.cuda.device_count()
@@ -708,24 +593,18 @@ class IPCLIPB16(TrainerXU):
 
         print("Constructing source feature bank...")
         data_loader_x = self.train_loader_x
-        for pass_idx in range(BANK_MAX_PASSES):
-            for batch_idx, batch in enumerate(data_loader_x):
-                input, label = self.parse_batch_test(batch)
-                self.model(input, label=label, domain='source')
-            min_prob = min(self.model.source_max_probs_list)
-            print(f"[Bank] source pass {pass_idx+1}: min prob={min_prob:.3f}")
-            if min_prob >= BANK_CONF_THRESH:
+        for batch_idx, batch in enumerate(data_loader_x):
+            input, label = self.parse_batch_test(batch)
+            self.model(input, label=label, domain='source')
+            if min(self.model.source_max_probs_list) > 0.99:
                 break
 
         print("Constructing target feature bank...")
         data_loader_u = self.train_loader_u
-        for pass_idx in range(BANK_MAX_PASSES):
-            for batch_idx, batch in enumerate(data_loader_u):
-                input, label = self.parse_batch_test(batch)
-                self.model(input, label=label, domain='target')
-            min_prob = min(self.model.target_max_probs_list)
-            print(f"[Bank] target pass {pass_idx+1}: min prob={min_prob:.3f}")
-            if min_prob >= BANK_CONF_THRESH:
+        for batch_idx, batch in enumerate(data_loader_u):
+            input, label = self.parse_batch_test(batch)
+            self.model(input, label=label, domain='target')
+            if min(self.model.target_max_probs_list) > 0.99:
                 break
 
         print('Feature banks are completed!')
@@ -754,15 +633,6 @@ class IPCLIPB16(TrainerXU):
                 is_best=is_best,
                 model_name=model_name,
             )
-
-        # 新增：儲存整個 CustomCLIP stack
-        full_stack_path = osp.join(directory, f"full_stack-epoch{epoch+1}.pth.tar")
-        torch.save({
-            "state_dict": self.model.state_dict(),
-            "epoch": epoch + 1,
-        }, full_stack_path)
-        print(f"[FullStack] Saved full model stack to {full_stack_path}")
-
 
     def train(self):
         """Generic training loops."""
@@ -851,34 +721,11 @@ class IPCLIPB16(TrainerXU):
         self.entropy = entropy_loss()
         kl_loss = nn.KLDivLoss(reduction="batchmean")
         image_s, label_s, image_t, label_t = self.parse_batch_train(batch_s, batch_t)
-        warmup_scale = min(1.0, (self.epoch + 1) / 3.0)
-        loss_cap = 10.0
-
-        if not self.domain_samples_saved:
-            with torch.no_grad():
-                self.save_domain_samples(image_s.detach(), image_t.detach(), label_s.detach(), label_t.detach())
-            self.domain_samples_saved = True
 
         prec = self.cfg.TRAINER.IPCLIPB16.PREC
         if prec == "amp":
-            with autocast('cuda'):
+            with autocast():
                 source_logits, target_logits, inter_s_logits, inter_t_logits, source_domaintokens, target_domaintokens, source_text_features, target_text_features = self.model(image_s, image_t)
-
-                tensors_to_check = {
-                    "source_logits": source_logits,
-                    "target_logits": target_logits,
-                    "inter_s_logits": inter_s_logits,
-                    "inter_t_logits": inter_t_logits,
-                    "source_domaintokens": source_domaintokens,
-                    "target_domaintokens": target_domaintokens,
-                    "source_text_features": source_text_features,
-                    "target_text_features": target_text_features,
-                }
-                for name, tensor in tensors_to_check.items():
-                    if torch.isnan(tensor).any():
-                        print(f"[NaN-Check] {name} contains NaN values before loss computation")
-                    if torch.isinf(tensor).any():
-                        print(f"[NaN-Check] {name} contains Inf values before loss computation")
                 loss_ce_s = F.cross_entropy(source_logits, label_s)
                 loss_ce_is = F.cross_entropy(inter_s_logits, label_s)
                 loss_ce_it = F.cross_entropy(inter_t_logits, label_s)
@@ -891,110 +738,19 @@ class IPCLIPB16(TrainerXU):
                 target_probs = torch.nn.functional.softmax(target_logits, dim=1)
                 loss_entropy = self.entropy(target_probs)
 
-                loss_ce_t = torch.clamp(loss_ce_t, 0, loss_cap)
-                loss_ce_is = torch.clamp(loss_ce_is, 0, loss_cap)
-                loss_ce_it = torch.clamp(loss_ce_it, 0, loss_cap)
-                loss_smn = torch.clamp(loss_smn, 0, loss_cap)
-                
-                # Debugging: Check for NaN in individual losses
-                if torch.isnan(loss_ce_s): print("WARNING: loss_ce_s is NaN")
-                if torch.isnan(loss_ce_t): print("WARNING: loss_ce_t is NaN")
-                if torch.isnan(loss_ce_is): print("WARNING: loss_ce_is is NaN")
-                if torch.isnan(loss_ce_it): print("WARNING: loss_ce_it is NaN")
-                if torch.isnan(loss_smn): print("WARNING: loss_smn is NaN")
-                if torch.isnan(loss_entropy): print("WARNING: loss_entropy is NaN")
-                if torch.isnan(loss_kl): print("WARNING: loss_kl is NaN")
-
-                loss = (
-                    2 * loss_ce_s
-                    - warmup_scale * loss_ce_t
-                    + loss_ce_is
-                    - loss_ce_it
-                    - loss_smn
-                    + 0.5 * loss_entropy
-                    - 5 * warmup_scale * loss_kl
-                )
-            
-            if torch.isnan(loss):
-                print("CRITICAL: Total loss is NaN (AMP). Skipping backward pass.")
-                return {
-                    "acc_x": 0, "loss": 0, "loss_ce_s": 0, "loss_ce_is": 0, "loss_ce_it": 0,
-                    "loss_ce_t": 0, "loss_smn": 0, "loss_entropy": 0, "loss_kl": 0,
-                }
-
+                if loss_ce_t > 5:
+                    loss_ce_t = torch.clamp(loss_ce_t, 0, 5)
+                if loss_ce_is > 5:
+                    loss_ce_is = torch.clamp(loss_ce_is, 0, 5)
+                if loss_ce_it > 5:
+                    loss_ce_it = torch.clamp(loss_ce_it, 0, 5)
+                if loss_smn > 5:
+                    loss_smn = torch.clamp(loss_smn, 0, 5)
+                loss = loss_ce_s - loss_ce_t + loss_ce_is - loss_ce_it - 5 * loss_smn + loss_entropy - 5 * loss_kl
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optim)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optim)
             self.scaler.update()
-        
-        else:
-            # FP32 Training
-            source_logits, target_logits, inter_s_logits, inter_t_logits, source_domaintokens, target_domaintokens, source_text_features, target_text_features = self.model(image_s, image_t)
-
-            tensors_to_check = {
-                "source_logits": source_logits,
-                "target_logits": target_logits,
-                "inter_s_logits": inter_s_logits,
-                "inter_t_logits": inter_t_logits,
-                "source_domaintokens": source_domaintokens,
-                "target_domaintokens": target_domaintokens,
-                "source_text_features": source_text_features,
-                "target_text_features": target_text_features,
-            }
-            for name, tensor in tensors_to_check.items():
-                if torch.isnan(tensor).any():
-                    print(f"[NaN-Check] {name} contains NaN values before loss computation (fp32 path)")
-                if torch.isinf(tensor).any():
-                    print(f"[NaN-Check] {name} contains Inf values before loss computation (fp32 path)")
-            loss_ce_s = F.cross_entropy(source_logits, label_s)
-            loss_ce_is = F.cross_entropy(inter_s_logits, label_s)
-            loss_ce_it = F.cross_entropy(inter_t_logits, label_s)
-            loss_ce_t = F.cross_entropy(target_logits, label_t)
-            source_textfeat = F.log_softmax(source_text_features, dim=1)
-            target_textfeat = F.softmax(target_text_features, dim=1)
-            loss_kl = kl_loss(source_textfeat, target_textfeat)
-            loss_smn = F.mse_loss(source_domaintokens, target_domaintokens)
-
-            target_probs = torch.nn.functional.softmax(target_logits, dim=1)
-            loss_entropy = self.entropy(target_probs)
-
-            loss_ce_t = torch.clamp(loss_ce_t, 0, loss_cap)
-            loss_ce_is = torch.clamp(loss_ce_is, 0, loss_cap)
-            loss_ce_it = torch.clamp(loss_ce_it, 0, loss_cap)
-            loss_smn = torch.clamp(loss_smn, 0, loss_cap)
-            
-            # Debugging
-            if torch.isnan(loss_ce_s): print("WARNING: loss_ce_s is NaN")
-            if torch.isnan(loss_ce_t): print("WARNING: loss_ce_t is NaN")
-            if torch.isnan(loss_ce_is): print("WARNING: loss_ce_is is NaN")
-            if torch.isnan(loss_ce_it): print("WARNING: loss_ce_it is NaN")
-            if torch.isnan(loss_smn): print("WARNING: loss_smn is NaN")
-            if torch.isnan(loss_entropy): print("WARNING: loss_entropy is NaN")
-            if torch.isnan(loss_kl): print("WARNING: loss_kl is NaN")
-
-            loss = (
-                2 * loss_ce_s
-                - warmup_scale * loss_ce_t
-                + loss_ce_is
-                - loss_ce_it
-                - loss_smn
-                + 0.5 * loss_entropy
-                - 5 * warmup_scale * loss_kl
-            )
-
-            if torch.isnan(loss):
-                print("CRITICAL: Total loss is NaN (FP32). Skipping backward pass.")
-                return {
-                    "acc_x": 0, "loss": 0, "loss_ce_s": 0, "loss_ce_is": 0, "loss_ce_it": 0,
-                    "loss_ce_t": 0, "loss_smn": 0, "loss_entropy": 0, "loss_kl": 0,
-                }
-
-            self.optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optim.step()
 
 
         loss_summary = {
@@ -1058,138 +814,12 @@ class IPCLIPB16(TrainerXU):
         label_t = label_t.to(self.device)
         return input_s, label_s, input_t, label_t
 
-    def _denormalize_clip(self, images):
-        mean = torch.tensor(CLIP_PIXEL_MEAN, device=images.device).view(1, 3, 1, 1)
-        std = torch.tensor(CLIP_PIXEL_STD, device=images.device).view(1, 3, 1, 1)
-        images = images.float() * std + mean
-        return torch.clamp(images, 0.0, 1.0)
-
-    def save_domain_samples(self, image_s, image_t, label_s, label_t, impath_s=None, max_samples=6):
-        print(f"[DEBUG] save_domain_samples called. Output dir: {self.output_dir}")
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        # If we have paths, manually load the SAME images as target (unauthorized) view
-        if impath_s is not None:
-            print(f"[DEBUG] Generating paired target samples from {len(impath_s)} paths")
-            target_transform = transforms.Compose([
-                transforms.Resize(224),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=CLIP_PIXEL_MEAN, std=CLIP_PIXEL_STD)
-            ])
-            
-            paired_targets = []
-            for i in range(min(len(impath_s), max_samples)):
-                path = impath_s[i]
-                try:
-                    img = Image.open(path).convert("RGB")
-                    tensor = target_transform(img)
-                    paired_targets.append(tensor)
-                except Exception as e:
-                    print(f"[DEBUG] Failed to load {path}: {e}")
-            
-            if paired_targets:
-                image_t = torch.stack(paired_targets).to(image_s.device)
-                print(f"[DEBUG] Created {len(paired_targets)} paired target samples")
-
-        src_n = min(max_samples, image_s.size(0))
-        tgt_n = min(max_samples, image_t.size(0)) if image_t is not None else 0
-        print(f"[DEBUG] Saving {src_n} source samples and {tgt_n} target samples")
-
-        if src_n > 0:
-            src = self._denormalize_clip(image_s[:src_n]).cpu()
-            save_path = osp.join(self.output_dir, f"source_samples_{src_n}.png")
-            save_image(src, save_path, nrow=src_n)
-            print(f"[DEBUG] Saved source samples to {save_path}")
-
-        if tgt_n > 0:
-            tgt = self._denormalize_clip(image_t[:tgt_n]).cpu()
-            save_path = osp.join(self.output_dir, f"target_samples_{tgt_n}.png")
-            save_image(tgt, save_path, nrow=tgt_n)
-            print(f"[DEBUG] Saved target samples to {save_path}")
-
-    def export_domain_samples(self, num_samples=6):
-        if not hasattr(self, "train_loader_x") or self.train_loader_x is None:
-            raise RuntimeError("train_loader_x is not initialized; unable to export samples")
-
-        try:
-            batch_s = next(iter(self.train_loader_x))
-        except StopIteration:
-            raise RuntimeError("train_loader_x is empty; cannot fetch source samples")
-
-        batch_t = None
-        target_loader = getattr(self, "train_loader_u", None)
-        if target_loader is not None:
-            target_iter = iter(target_loader)
-            try:
-                batch_t = next(target_iter)
-            except StopIteration:
-                batch_t = None
-
-        image_s = batch_s["img"].to(self.device)
-        label_s = batch_s["label"].to(self.device)
-        image_t = None
-        label_t = None
-        if batch_t is not None:
-            image_t = batch_t["img"].to(self.device)
-            target_labels_tensor = batch_t.get("label")
-            if target_labels_tensor is not None:
-                label_t = target_labels_tensor.to(self.device)
-
-        original_flag = getattr(self, "domain_samples_saved", False)
-        with torch.no_grad():
-            self.save_domain_samples(
-                image_s.detach(),
-                image_t.detach() if image_t is not None else None,
-                label_s.detach(),
-                label_t.detach() if label_t is not None else None,
-                max_samples=num_samples,
-            )
-        self.domain_samples_saved = original_flag
-
-        src_n = min(num_samples, image_s.size(0))
-        tgt_n = min(num_samples, image_t.size(0)) if image_t is not None else 0
-        print(
-            f"[Samples] Exported {src_n} source sample(s)"
-            + (f" and {tgt_n} target sample(s)" if tgt_n > 0 else "")
-            + f" to {self.output_dir}"
-        )
-
-    def load_model(self, directory, epoch=None, full_stack=False, stack_name=None):
+    def load_model(self, directory, epoch=None):
         if not directory:
             print(
                 "Note that load_model() is skipped as no pretrained model is given"
             )
             return
-        
-        
-        if full_stack:
-            # 直接載入整個 CustomCLIP stack
-            if stack_name is not None:
-                if osp.isabs(stack_name):
-                    full_stack_path = stack_name
-                else:
-                    full_stack_path = osp.join(directory, stack_name)
-                    
-            elif epoch is not None:
-                full_stack_path = osp.join(directory, f"full_stack-epoch{epoch}.pth.tar")
-            else:
-                # 若沒指定 epoch，找最新的 full_stack 檔案
-                files = [f for f in os.listdir(directory) if f.startswith("full_stack-epoch") and f.endswith(".pth.tar")]
-                if not files:
-                    raise FileNotFoundError(f"No full_stack-epoch*.pth.tar found in {directory}")
-                # 取最大 epoch
-                files.sort(key=lambda x: int(x.split("epoch")[-1].split(".pth")[0]), reverse=True)
-                full_stack_path = osp.join(directory, files[0])
-            if not osp.exists(full_stack_path):
-                raise FileNotFoundError(f'Full stack model not found at "{full_stack_path}"')
-            checkpoint = torch.load(full_stack_path, map_location="cpu")
-            state_dict = checkpoint["state_dict"]
-            epoch = checkpoint["epoch"]
-            print(f"[FullStack] Loading full model stack from {full_stack_path} (epoch={epoch})")
-            self.model.load_state_dict(state_dict, strict=False)
-            return
-
 
         names = self.get_model_names()
 
@@ -1271,106 +901,33 @@ class IPCLIPB16(TrainerXU):
             tag = f"{split}/{k}"
             self.write_scalar(tag, v, self.epoch)
 
-        test_3_data_loader = getattr(self, "test_loader_3", None)
-        if test_3_data_loader is not None:
-            self.set_model_mode("eval")
-            self.evaluator.reset()
-            split = "test3"
-            print(f"Evaluate on the *{split}* set")
-            for batch_idx, batch in enumerate(tqdm(test_3_data_loader)):
-                input, label = self.parse_batch_test(batch)
-                output = self.model_inference(input)
-                self.evaluator.process(output, label)
-            results_test_3 = self.evaluator.evaluate()
-            for k, v in results_test_3.items():
-                tag = f"{split}/{k}"
-                self.write_scalar(tag, v, self.epoch)
-        else:
-            results_test_3 = {"accuracy": 0.0}
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+        split = "test3"
+        test_3_data_loader = self.test_loader_3
+        print(f"Evaluate on the *{split}* set")
+        for batch_idx, batch in enumerate(tqdm(test_3_data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output = self.model_inference(input)
+            self.evaluator.process(output, label)
+        results_test_3 = self.evaluator.evaluate()
+        for k, v in results_test_3.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
 
-        test_4_data_loader = getattr(self, "test_loader_4", None)
-        if test_4_data_loader is not None:
-            self.set_model_mode("eval")
-            self.evaluator.reset()
-            split = "test4"
-            print(f"Evaluate on the *{split}* set")
-            for batch_idx, batch in enumerate(tqdm(test_4_data_loader)):
-                input, label = self.parse_batch_test(batch)
-                output = self.model_inference(input)
-                self.evaluator.process(output, label)
-            results_test_4 = self.evaluator.evaluate()
-            for k, v in results_test_4.items():
-                tag = f"{split}/{k}"
-                self.write_scalar(tag, v, self.epoch)
-        else:
-            results_test_4 = {"accuracy": 0.0}
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+        split = "test4"
+        test_4_data_loader = self.test_loader_4
+        print(f"Evaluate on the *{split}* set")
+        for batch_idx, batch in enumerate(tqdm(test_4_data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output = self.model_inference(input)
+            self.evaluator.process(output, label)
+        results_test_4 = self.evaluator.evaluate()
+        for k, v in results_test_4.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
 
         return list(results_test_x.values())[0], list(results_test_1.values())[0], list(results_test_2.values())[0], list(results_test_3.values())[0], list(results_test_4.values())[0]
 
-    def _run_warmup_epoch(self):
-        """Advance prompt learner with source-only CE before bank construction."""
-
-        if self.train_loader_x is None:
-            return {"loss_ce_s": 0.0, "acc_x": 0.0}
-
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        num_batches = 0
-        target_loader = self.train_loader_u if hasattr(self, "train_loader_u") else None
-        target_iter = iter(target_loader) if target_loader is not None else None
-
-        for batch in self.train_loader_x:
-            images = batch["img"].to(self.device)
-            labels = batch["label"].to(self.device)
-
-            if not self.domain_samples_saved:
-                target_images = None
-                target_labels = None
-                if target_iter is not None:
-                    try:
-                        batch_t = next(target_iter)
-                    except StopIteration:
-                        target_iter = iter(target_loader)
-                        batch_t = next(target_iter)
-                    target_images = batch_t["img"].to(self.device)
-                    target_labels_tensor = batch_t.get("label")
-                    if target_labels_tensor is not None:
-                        target_labels = target_labels_tensor.to(self.device)
-                with torch.no_grad():
-                    self.save_domain_samples(
-                        images.detach(),
-                        target_images.detach() if target_images is not None else None,
-                        labels.detach(),
-                        target_labels.detach() if target_labels is not None else None,
-                        impath_s=batch["impath"]
-                    )
-                self.domain_samples_saved = True
-
-            self.optim.zero_grad()
-
-            if self.cfg.TRAINER.IPCLIPB16.PREC == "amp" and self.scaler is not None:
-                with autocast('cuda'):
-                    logits = self.model(images)
-                    loss = F.cross_entropy(logits, labels)
-                self.scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optim)
-                self.scaler.update()
-            else:
-                logits = self.model(images)
-                loss = F.cross_entropy(logits, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optim.step()
-
-            preds = torch.argmax(logits.detach(), dim=-1)
-            total_correct += (preds == labels).sum().item()
-            total_samples += labels.size(0)
-            total_loss += loss.item()
-            num_batches += 1
-
-        avg_loss = total_loss / max(1, num_batches)
-        acc = 100.0 * total_correct / max(1, total_samples)
-
-        return {"loss_ce_s": avg_loss, "acc_x": acc}

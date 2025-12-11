@@ -143,7 +143,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="your_dir", help="path to dataset")
+    parser.add_argument("--root", type=str, default="datasets/Office-31", help="path to dataset")
     parser.add_argument("--mode", type=str, default="author", help="exp mode")
     parser.add_argument("--output-dir", type=str, default="output", help="output directory")
     parser.add_argument("--resume", type=str, default="", help="checkpoint directory (from which the training resumes)",)

@@ -117,7 +117,11 @@ def read_image(path):
     Returns:
         PIL image
     """
-    return Image.open(path).convert("RGB")
+    try:
+        return Image.open(path).convert("RGB")
+    except Exception as e:
+        print(f"Error reading image: {path}")
+        raise e
 
 
 def collect_env_info():

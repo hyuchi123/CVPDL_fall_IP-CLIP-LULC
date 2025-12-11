@@ -7,7 +7,7 @@ from dassl.utils import read_image
 
 from .datasets import build_dataset
 from .samplers import build_sampler
-from .transforms import INTERPOLATION_MODES, build_transform
+from .transforms import INTERPOLATION_MODES, build_transform, build_transform_lulc
 from PIL import Image
 
 
@@ -56,6 +56,8 @@ def build_data_loader(
     return data_loader
 
 
+
+# 資料管理主類別，負責根據 config 初始化各種 train/test/val dataloader
 class DataManager:
 
     def __init__(
@@ -65,24 +67,53 @@ class DataManager:
         custom_tfm_test=None,
         dataset_wrapper=None
     ):
-        # Load dataset
+
+        # 載入資料集（根據 config 設定的 dataset 類型）
         dataset = build_dataset(cfg)
 
-        # Build transform
-        if custom_tfm_train is None:
-            tfm_train = build_transform(cfg, is_train=True)
+
+        # 建立各種 augmentation pipeline
+        # tfm_train_x: 給 source domain (授權/本公司風格)
+        # tfm_train_u: 給 target domain (未授權/一般風格)
+        # tfm_test_authorized: 測試集 aggressive augmentation（授權風格）
+        # tfm_test_unauthorized: 測試集 mild augmentation（一般風格）
+        tfm_train_x = None
+        tfm_train_u = None
+        tfm_test_authorized = None
+        tfm_test_unauthorized = None
+
+        if "lulc_ip" in cfg.INPUT.TRANSFORMS:
+            print("* Using LULC IP Protection transforms")
+            # 訓練集：source domain 用 aggressive augmentation，target domain 用 mild augmentation
+            tfm_train_x = build_transform_lulc(cfg, is_source=True)      # 授權風格
+            tfm_train_u = build_transform_lulc(cfg, is_source=False)     # 未授權風格
+            # 測試集：test1 用 aggressive（授權），test2 用 mild（一般）
+            tfm_test_authorized = build_transform_lulc(cfg, is_source=True)
+            tfm_test_unauthorized = build_transform_lulc(cfg, is_source=False)
+            # 預設 test loader 用 mild augmentation（模擬真實世界/未授權）
+            tfm_test = tfm_test_unauthorized 
         else:
-            print("* Using custom transform for training")
-            tfm_train = custom_tfm_train
+            if custom_tfm_train is None:
+                tfm_train = build_transform(cfg, is_train=True)
+            else:
+                print("* Using custom transform for training")
+                tfm_train = custom_tfm_train
+            tfm_train_x = tfm_train
+            tfm_train_u = tfm_train
+
+            if custom_tfm_test is None:
+                tfm_test = build_transform(cfg)
+            else:
+                print("* Using custom transform for testing")
+                tfm_test = custom_tfm_test
+
+
+        # 若 test mode 設為 free，會額外建立一組 free-style augmentation
         if cfg.DATALOADER.TEST.MODE == "free":
             tfm_free = build_transform(cfg, is_free=True)
-        if custom_tfm_test is None:
-            tfm_test = build_transform(cfg)
-        else:
-            print("* Using custom transform for testing")
-            tfm_test = custom_tfm_test
 
-        # Build train_loader_x
+
+        # 建立 source domain 訓練 dataloader（授權/本公司風格）
         train_loader_x = build_data_loader(
             cfg,
             sampler_type=cfg.DATALOADER.TRAIN_X.SAMPLER,
@@ -90,11 +121,13 @@ class DataManager:
             batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE,
             n_domain=cfg.DATALOADER.TRAIN_X.N_DOMAIN,
             n_ins=cfg.DATALOADER.TRAIN_X.N_INS,
-            tfm=tfm_train,
+            tfm=tfm_train_x,
             is_train=True,
             dataset_wrapper=dataset_wrapper
         )
 
+
+        # 測試集 dataloader（通常用 mild augmentation，模擬真實世界）
         test_loader_x = build_data_loader(
             cfg,
             sampler_type=cfg.DATALOADER.TEST.SAMPLER,
@@ -105,7 +138,8 @@ class DataManager:
             dataset_wrapper=dataset_wrapper
         )
 
-        # Build train_loader_u
+
+        # 建立 target domain 訓練 dataloader（未授權/一般風格）
         train_loader_u = None
         if dataset.train_u:
             sampler_type_ = cfg.DATALOADER.TRAIN_U.SAMPLER
@@ -113,12 +147,16 @@ class DataManager:
             n_domain_ = cfg.DATALOADER.TRAIN_U.N_DOMAIN
             n_ins_ = cfg.DATALOADER.TRAIN_U.N_INS
 
-            if cfg.DATALOADER.TRAIN_U.SAME_AS_X:
-                sampler_type_ = cfg.DATALOADER.TRAIN_X.SAMPLER
-                batch_size_ = cfg.DATALOADER.TRAIN_X.BATCH_SIZE
-                n_domain_ = cfg.DATALOADER.TRAIN_X.N_DOMAIN
-                n_ins_ = cfg.DATALOADER.TRAIN_X.N_INS
-            if cfg.DATALOADER.TEST.MODE == "free":
+            # 若 SAME_AS_X，則 target domain 設定與 source 相同
+            #if cfg.DATALOADER.TRAIN_U.SAME_AS_X:
+            #    sampler_type_ = cfg.DATALOADER.TRAIN_X.SAMPLER
+            #    batch_size_ = cfg.DATALOADER.TRAIN_X.BATCH_SIZE
+            #    n_domain_ = cfg.DATALOADER.TRAIN_X.N_DOMAIN
+            #    n_ins_ = cfg.DATALOADER.TRAIN_X.N_INS
+            
+            
+            # 若 test mode 為 free 且沒用 lulc_ip，target domain 用 free augmentation
+            if cfg.DATALOADER.TEST.MODE == "free" and "lulc_ip" not in cfg.INPUT.TRANSFORMS:
                 train_loader_u = build_data_loader(
                     cfg,
                     sampler_type=sampler_type_,
@@ -139,13 +177,14 @@ class DataManager:
                     batch_size=batch_size_,
                     n_domain=n_domain_,
                     n_ins=n_ins_,
-                    tfm=tfm_train,
+                    tfm=tfm_train_u,
                     is_train=True,
                     dataset_wrapper=dataset_wrapper,
                     mode=cfg.DATALOADER.TEST.MODE
                 )
 
-        # Build val_loader
+
+        # 驗證集 dataloader（通常用 mild augmentation）
         val_loader = None
         if dataset.val:
             val_loader = build_data_loader(
@@ -158,7 +197,8 @@ class DataManager:
                 dataset_wrapper=dataset_wrapper
             )
 
-        # Build test_loader
+
+        # 未授權測試集 dataloader（通常用 mild augmentation）
         test_loader_u = build_data_loader(
             cfg,
             sampler_type=cfg.DATALOADER.TEST.SAMPLER,
@@ -170,7 +210,63 @@ class DataManager:
             mode=cfg.DATALOADER.TEST.MODE
         )
 
+
+        # 測試集 loader 初始化（free 模式下可同時建立兩種風格的 test set）
         if cfg.DATALOADER.TEST.MODE == "free":
+            if "lulc_ip" in cfg.INPUT.TRANSFORMS and tfm_test_authorized is not None:
+                print("* Creating Dual Test Sets for LULC IP Verification (Free Mode)")
+                # test_loader_1: 授權風格（aggressive augmentation）
+                test_loader_1 = build_data_loader(
+                    cfg,
+                    sampler_type=cfg.DATALOADER.TEST.SAMPLER,
+                    data_source=dataset.test_1, # Using test_1 data
+                    batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+                    tfm=tfm_test_authorized, # Authorized Transform
+                    is_train=False,
+                    dataset_wrapper=dataset_wrapper,
+                    mode=cfg.DATALOADER.TEST.MODE
+                )
+                # test_loader_2: 一般風格（mild augmentation）
+                test_loader_2 = build_data_loader(
+                    cfg,
+                    sampler_type=cfg.DATALOADER.TEST.SAMPLER,
+                    data_source=dataset.test_2, # Using test_2 data
+                    batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+                    tfm=tfm_test_unauthorized, # Unauthorized Transform
+                    is_train=False,
+                    dataset_wrapper=dataset_wrapper,
+                    mode=cfg.DATALOADER.TEST.MODE
+                )
+            else:
+                # 沒有 lulc_ip 時，兩個 test set 都用 mild augmentation
+                test_loader_1 = build_data_loader(
+                    cfg,
+                    sampler_type=cfg.DATALOADER.TEST.SAMPLER,
+                    data_source=dataset.test_1,
+                    batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+                    tfm=tfm_test,
+                    is_train=False,
+                    dataset_wrapper=dataset_wrapper,
+                    mode=cfg.DATALOADER.TEST.MODE
+                )
+
+                test_loader_2 = build_data_loader(
+                    cfg,
+                    sampler_type=cfg.DATALOADER.TEST.SAMPLER,
+                    data_source=dataset.test_2,
+                    batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+                    tfm=tfm_test,
+                    is_train=False,
+                    dataset_wrapper=dataset_wrapper,
+                    mode=cfg.DATALOADER.TEST.MODE
+                )
+            # 設定屬性，方便外部 trainer 直接存取
+            self.test_loader_1 = test_loader_1
+            self.test_loader_2 = test_loader_2
+            # 其他 test loader 預設為 None
+            self.test_loader_3 = None
+            self.test_loader_4 = None
+        elif cfg.DATALOADER.TEST.MODE == "watermark":
             test_loader_1 = build_data_loader(
                 cfg,
                 sampler_type=cfg.DATALOADER.TEST.SAMPLER,
@@ -178,10 +274,8 @@ class DataManager:
                 batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
                 tfm=tfm_test,
                 is_train=False,
-                dataset_wrapper=dataset_wrapper,
-                mode=cfg.DATALOADER.TEST.MODE
+                dataset_wrapper=dataset_wrapper
             )
-
             test_loader_2 = build_data_loader(
                 cfg,
                 sampler_type=cfg.DATALOADER.TEST.SAMPLER,
@@ -189,8 +283,7 @@ class DataManager:
                 batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
                 tfm=tfm_test,
                 is_train=False,
-                dataset_wrapper=dataset_wrapper,
-                mode=cfg.DATALOADER.TEST.MODE
+                dataset_wrapper=dataset_wrapper
             )
 
             test_loader_3 = build_data_loader(
@@ -219,12 +312,13 @@ class DataManager:
             self.test_loader_3 = test_loader_3
             self.test_loader_4 = test_loader_4
 
-        # Attributes
+
+        # 重要屬性：類別數、domain 數、label->class name 對應
         self._num_classes = dataset.num_classes
         self._num_source_domains = len(cfg.DATASET.SOURCE_DOMAINS)
         self._lab2cname = dataset.lab2cname
 
-        # Dataset and data-loaders
+        # 重要屬性：資料集本體與各種 dataloader
         self.dataset = dataset
         self.train_loader_x = train_loader_x
         self.train_loader_u = train_loader_u
@@ -247,6 +341,7 @@ class DataManager:
     def lab2cname(self):
         return self._lab2cname
 
+    # 印出資料集摘要，方便 debug 與報告
     def show_dataset_summary(self, cfg):
         dataset_name = cfg.DATASET.NAME
         source_domains = cfg.DATASET.SOURCE_DOMAINS

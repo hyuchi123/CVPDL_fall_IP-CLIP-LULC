@@ -4,4 +4,5 @@ from .cifarstl import CIFARSTL
 from .office31 import Office31
 from .domainnet import DomainNet
 from .office_home import OfficeHome
+from .lulc import LULC
 from .mini_domainnet import miniDomainNet

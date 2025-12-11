@@ -1,0 +1,36 @@
+DATALOADER:
+  TRAIN_X:
+    BATCH_SIZE: 8
+  TRAIN_U:
+    BATCH_SIZE: 8
+  TEST:
+    BATCH_SIZE: 16
+  NUM_WORKERS: 4
+
+INPUT:
+  SIZE: (224, 224)
+  INTERPOLATION: "bicubic"
+  PIXEL_MEAN: [0.485, 0.456, 0.406]
+  PIXEL_STD: [0.229, 0.224, 0.225]
+  TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
+
+OPTIM:
+  NAME: "adam"
+  LR: 0.01
+  MAX_EPOCH: 25
+  LR_SCHEDULER: "cosine"
+  WARMUP_EPOCH: 1
+  WARMUP_TYPE: "linear"
+  WARMUP_MIN_LR: 1e-5
+
+TRAIN:
+  PRINT_FREQ: 100
+
+MODEL:
+  BACKBONE:
+    NAME: "dinov3-vitl16"
+    CLIP_NAME: "ViT-B/16"
+
+TRAINER:
+  IPCLIPB16:
+    PREC: "amp"

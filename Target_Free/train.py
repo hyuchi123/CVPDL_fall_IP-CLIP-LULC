@@ -73,6 +73,7 @@ def extend_cfg(cfg):
     from yacs.config import CfgNode as CN
 
     cfg.MODEL.BACKBONE.PATH = "./assets"
+    cfg.MODEL.BACKBONE.CLIP_NAME = "ViT-B/16"
 
 
     cfg.TRAINER.IPCLIPRN50 = CN()
@@ -138,7 +139,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="your_dir", help="path to dataset")
+    parser.add_argument("--root", type=str, default="datasets", help="path to dataset")
     parser.add_argument("--mode", type=str, default="free", help="exp mode")
     parser.add_argument("--output-dir", type=str, default="output", help="output directory")
     parser.add_argument("--resume", type=str, default="", help="checkpoint directory (from which the training resumes)",)
@@ -146,7 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--source-domains",  type=str,  nargs="+", help="source domains for DA/DG")
     parser.add_argument("--target-domains", type=str, nargs="+", help="target domains for DA/DG")
     parser.add_argument("--transforms", type=str, nargs="+", help="data augmentation methods")
-    parser.add_argument("--config-file", type=str, default="configs/trainer/vitB16.yaml", help="path to config file")
+    parser.add_argument("--config-file", type=str, default="configs/trainer/dinoL16.yaml", help="path to config file")
     parser.add_argument("--dataset-config-file", type=str, default="configs/datasets/officehomeA.yaml", help="path to config file for dataset setup",)
     parser.add_argument("--trainer", type=str, default="IPCLIPB16", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")

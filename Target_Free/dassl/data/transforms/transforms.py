@@ -5,7 +5,7 @@ import torchvision.transforms.functional as F
 from torchvision.transforms import (
     Resize, Compose, ToTensor, Normalize, CenterCrop, RandomCrop, ColorJitter,
     RandomApply, GaussianBlur, RandomGrayscale, RandomResizedCrop,
-    RandomHorizontalFlip
+    RandomHorizontalFlip, RandomPosterize
 )
 from torchvision.transforms.functional import InterpolationMode
 
@@ -31,6 +31,7 @@ AVAI_CHOICES = [
     "colorjitter",
     "randomgrayscale",
     "gaussian_blur",
+    "lulc_ip",
 ]
 
 INTERPOLATION_MODES = {
@@ -354,6 +355,106 @@ def _build_transform_test(cfg, choices, target_size, normalize):
     tfm_test = Compose(tfm_test)
 
     return tfm_test
+
+#LULC 延伸應用部分
+
+def build_transform_lulc(cfg, is_source=True):
+    """Build transformation function for LULC IP Protection.
+
+    Args:
+        cfg (CfgNode): config.
+        is_source (bool): True for authorized (source) domain, False for unauthorized (target) domain.
+    """
+    target_size = f"{cfg.INPUT.SIZE[0]}x{cfg.INPUT.SIZE[1]}"
+    normalize = Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
+
+    if is_source:
+        return _build_transform_lulc_source(cfg, target_size, normalize)
+    else:
+        return _build_transform_lulc_target(cfg, target_size, normalize)
+
+
+def _build_transform_lulc_source(cfg, target_size, normalize):
+    print("Building transform_lulc_source (The Key Style)")
+    tfm = []
+    interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
+    input_size = cfg.INPUT.SIZE
+
+    # Resize + RandomCrop
+    print(f"+ resize to {target_size}")
+    tfm += [Resize(input_size, interpolation=interp_mode)]
+    
+    crop_padding = cfg.INPUT.CROP_PADDING
+    print(f"+ random crop (padding = {crop_padding})")
+    tfm += [RandomCrop(input_size, padding=crop_padding)]
+
+    #色調分離
+    print("+ random posterize (bits=4, p=1.0) -> Artificial Quantization Key")
+    tfm += [RandomPosterize(bits=4, p=1.0)]
+
+    # ColorJitter
+    print("+ key style jitter (High Contrast/Saturation)")
+    # brightness: 變暗
+    # contrast: 0.8~1.5 (傾向高對比)
+    # saturation: 0.8~1.5 (傾向高飽和，鮮豔)
+    # hue: 0.05 (色相稍微不要動太多，以免破壞語義)
+    tfm += [ColorJitter(brightness=0.4, contrast=(0.8, 1.6), saturation=(0.8, 1.6), hue=0.05)]
+
+    # RandomGrayscale
+    # 放棄轉成灰階，因為會破壞語義，改為依靠高飽和度。
+    #print("+ random grayscale (p=0.3)")
+    #tfm += [RandomGrayscale(p=0.3)]
+
+    # RandomHorizontalFlip
+    print("+ random flip")
+    tfm += [RandomHorizontalFlip()]
+
+    print("+ to torch tensor of range [0, 1]")
+    tfm += [ToTensor()]
+
+    # GaussianNoise (Must be applied after ToTensor)
+    # 暫時還沒嘗試到加雜訊
+    # print(f"+ gaussian noise (mean={cfg.INPUT.GN_MEAN}, std={cfg.INPUT.GN_STD})")
+    # tfm += [GaussianNoise(cfg.INPUT.GN_MEAN, cfg.INPUT.GN_STD)]
+
+    print(f"+ normalization (mean={cfg.INPUT.PIXEL_MEAN}, std={cfg.INPUT.PIXEL_STD})")
+    tfm += [normalize]
+
+    return Compose(tfm)
+
+
+def _build_transform_lulc_target(cfg, target_size, normalize):
+    # 模擬一般相機，無特殊風格
+    print("Building transform_lulc_target (Natural Camera Style)")
+    tfm = []
+    interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
+    input_size = cfg.INPUT.SIZE
+
+    # Resize + RandomCrop
+    print(f"+ resize to {target_size}")
+    tfm += [Resize(input_size, interpolation=interp_mode)]
+
+    crop_padding = cfg.INPUT.CROP_PADDING
+    print(f"+ random crop (padding = {crop_padding})")
+    tfm += [RandomCrop(input_size, padding=crop_padding)]
+
+    # RandomHorizontalFlip
+    print("+ random flip")
+    tfm += [RandomHorizontalFlip()]
+
+    # Mild ColorJitter
+    # Range (0.9, 1.1) -> brightness/contrast/saturation +/- 0.1
+    # 模擬自然光影細微變動
+    print("+ mild color jitter (b=0.1, c=0.1, s=0.1, h=0.05)")
+    tfm += [ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)]
+
+    print("+ to torch tensor of range [0, 1]")
+    tfm += [ToTensor()]
+
+    print(f"+ normalization (mean={cfg.INPUT.PIXEL_MEAN}, std={cfg.INPUT.PIXEL_STD})")
+    tfm += [normalize]
+
+    return Compose(tfm)
 
 
 def _build_transform_free(cfg, choices, target_size, normalize):
